@@ -1,0 +1,20 @@
+
+      - name: Install Modrinth App
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if (-not (Get-Command winget.exe -ErrorAction SilentlyContinue)) {
+              throw "WinGet is not available on this runner."
+          }
+
+          winget install -e --id Modrinth.ModrinthApp `
+            --silent `
+            --accept-package-agreements `
+            --accept-source-agreements
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Modrinth App installation failed."
+          }
+
+          Write-Host "Modrinth App installation completed."
