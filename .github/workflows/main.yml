@@ -86,7 +86,7 @@ jobs:
           if (-not $ip) { & $ts status; throw 'tailscale got no ip' }
           "TAILSCALE_IP=$ip" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: 4. reach E: drive
+      - name: "4. reach E: drive"
         shell: pwsh
         env:
           SMB_PASSWORD: ${{ secrets:SMB_PASSWORD }}
