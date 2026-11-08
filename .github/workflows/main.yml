@@ -6,9 +6,6 @@ on:
       duration_minutes:
         description: How long to keep the session up (max 300)
         default: "180"
-      sync_every_minutes:
-        description: "How often to copy back to E:"
-        default: "5"
 
 concurrency:
   group: rdp-session
@@ -19,39 +16,8 @@ env:
   # absolute paths like C:\Users\util\..., and they have to match on both machines.
   RDP_USER: util
   PROFILE: C:\Users\util
-  PC: \\100.120.215.94\RDP          # <- your pc on the tailnet (see setup-my-pc.ps1 output)
+  PC: \\100.120.215.94\RDP          # <- your pc on the tailnet
   SMB_USER: rdpsync
-
-  # light tier: small stuff, copied every few minutes
-  FOLDERS: >-
-    Documents,Downloads,Music,
-    AppData\Roaming\Spotify,
-    AppData\Roaming\Code\User,
-    .ssh,.gitconfig
-
-  # heavy tier: hundreds of MB, copied once at boot and once at the end.
-  HEAVY: >-
-    AppData\Roaming\Mozilla,
-    AppData\Roaming\Limyrx,
-    AppData\Roaming\ModrinthApp\app.db,
-    AppData\Roaming\ModrinthApp\app.db-wal
-  #
-  # LEFT OUT ON PURPOSE - too big to copy, junction them instead (adopt-local.ps1):
-  #   Desktop     71.8 GB   1,033,676 files   (Projects 43, Limyrx 24, Redmi backup 11)
-  #   Pictures    46.2 GB      11,356 files
-  #   Videos       5.8 GB         157 files
-  # Copying 122 GB into the profile every run is slower than just using the share.
-  # AppData\Roaming\.tlauncher            (451 MB)
-  # AppData\Roaming\PrismLauncher
-  # AppData\Roaming\ATLauncher
-  # AppData\Roaming\Telegram Desktop\tdata
-  #
-  # NOT copied, junctioned to Z: at logon instead (step 7):
-  #   %APPDATA%\.minecraft                 3 GB
-  #   %APPDATA%\ModrinthApp\profiles      18 GB  instances
-  #   %APPDATA%\ModrinthApp\meta           4 GB  metadata cache
-  #   %APPDATA%\ModrinthApp\store          3 GB  downloaded jars
-  #   %APPDATA%\horizon-launcher         1.6 GB
 
 jobs:
   rdp:
@@ -120,10 +86,10 @@ jobs:
           if (-not $ip) { & $ts status; throw 'tailscale got no ip' }
           "TAILSCALE_IP=$ip" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: "4. reach E: drive + helpers"
+      - name: 4. reach E: drive
         shell: pwsh
         env:
-          SMB_PASSWORD: ${{ secrets.SMB_PASSWORD }}
+          SMB_PASSWORD: ${{ secrets:SMB_PASSWORD }}
         run: |
           $ok = $false
           for ($i = 0; $i -lt 10 -and -not $ok; $i++) {
@@ -139,50 +105,17 @@ jobs:
           if (-not $ok) { throw "cannot reach $env:PC - is the pc on, awake, and connected to tailscale?" }
           Get-ChildItem S:\ | Format-Table Name
 
-          New-Item -ItemType Directory C:\rdp -Force | Out-Null
-          @'
-          $global:RdpHome  = $env:PROFILE
-          $global:RdpShelf = 'S:\profile'
-
-          function Sync-Path([string]$rel, [switch]$Up) {
-            $rel = $rel.Trim().Trim('\')
-            if (-not $rel) { return }
-            $src = if ($Up) { Join-Path $global:RdpHome  $rel } else { Join-Path $global:RdpShelf $rel }
-            $dst = if ($Up) { Join-Path $global:RdpShelf $rel } else { Join-Path $global:RdpHome  $rel }
-            if (-not (Test-Path -LiteralPath $src)) { return }
-
-            if (Test-Path -LiteralPath $src -PathType Container) {
-              New-Item -ItemType Directory $dst -Force | Out-Null
-              robocopy $src $dst /E /R:1 /W:1 /NFL /NDL /NJH /NJS /NP /XF *.tmp *.crdownload | Out-Null
-              if ($LASTEXITCODE -ge 8) { Write-Warning "sync $rel -> $($LASTEXITCODE)" }
-            } else {
-              New-Item -ItemType Directory (Split-Path $dst -Parent) -Force | Out-Null
-              Copy-Item -LiteralPath $src -Destination $dst -Force -ErrorAction SilentlyContinue
-            }
-            $global:LASTEXITCODE = 0
-          }
-
-          function Sync-List([string]$list, [switch]$Up) {
-            foreach ($rel in $list.Split(',')) { Sync-Path $rel -Up:$Up }
-          }
-          '@ | Set-Content C:\rdp\sync.ps1 -Encoding utf8
-
-      - name: 5. pull my files back
+      - name: 5. profile folder
         shell: pwsh
         run: |
-          . C:\rdp\sync.ps1
+          # hand the profile folder to the user before windows builds it, or first logon can fail.
+          # nothing is copied in: everything big lives on Z: (see step 7).
           New-Item -ItemType Directory $env:PROFILE -Force | Out-Null
-          # hand the profile folder to RDP before windows builds the profile, or first logon can fail
           $acl = Get-Acl $env:PROFILE
           $acl.SetOwner([System.Security.Principal.NTAccount]$env:RDP_USER)
           $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
             $env:RDP_USER,'FullControl','ContainerInherit,ObjectInherit','None','Allow'))
           Set-Acl $env:PROFILE $acl
-
-          Sync-List $env:FOLDERS -Down
-          Write-Host 'light files restored'
-          Sync-List $env:HEAVY -Down
-          Write-Host 'heavy files restored'
 
       - name: 6. apps
         shell: pwsh
@@ -213,28 +146,16 @@ jobs:
       - name: 7. session
         shell: pwsh
         env:
-          SMB_PASSWORD: ${{ secrets.SMB_PASSWORD }}
+          SMB_PASSWORD: ${{ secrets:SMB_PASSWORD }}
         run: |
-          $loop = 'C:\rdp\loop.ps1'
-          @'
-          param($Every)
-          . C:\rdp\sync.ps1
-          while ($true) {
-            Sync-List $env:FOLDERS -Up
-            Start-Sleep -Seconds (60 * [int]$Every)
-          }
-          '@ | Set-Content $loop -Encoding utf8
-
-          $every = '${{ inputs.sync_every_minutes }}'
-          Start-Process pwsh -WindowStyle Hidden -ArgumentList @('-NoProfile','-File',$loop,'-Every',$every)
-
-          # Z: = the whole E:\RDP\files, live, inside your session (220 GB, nothing copied).
-          # the junctions make big game folders appear as normal local folders.
+          # Z: = E:\RDP\files, live. The junctions make the big game folders look
+          # local, so nothing is copied at boot - the runner is usable in seconds.
           $startup = Join-Path $env:PROFILE 'AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup'
           New-Item -ItemType Directory $startup -Force | Out-Null
           $cmd = @"
           @echo off
           net use Z: $env:PC\files /user:$env:SMB_USER $env:SMB_PASSWORD /persistent:no >nul 2>&1
+          net use Y: $env:PC\profile /user:$env:SMB_USER $env:SMB_PASSWORD /persistent:no >nul 2>&1
 
           if exist "Z:\minecraft" if not exist "%APPDATA%\.minecraft" mklink /J "%APPDATA%\.minecraft" "Z:\minecraft" >nul 2>&1
 
@@ -246,9 +167,9 @@ jobs:
           if exist "Z:\horizon-launcher" if not exist "%APPDATA%\horizon-launcher" mklink /J "%APPDATA%\horizon-launcher" "Z:\horizon-launcher" >nul 2>&1
 
           rem only if adopt-local.ps1 was run with -IncludeDesktop / -IncludePictures / -IncludeVideos
-          if exist "Z:\profile\Desktop" for /d %%d in ("Z:\profile\Desktop\*") do if not exist "%USERPROFILE%\Desktop\%%~nxd" mklink /J "%USERPROFILE%\Desktop\%%~nxd" "%%d" >nul 2>&1
-          if exist "Z:\profile\Pictures" for /d %%d in ("Z:\profile\Pictures\*") do if not exist "%USERPROFILE%\Pictures\%%~nxd" mklink /J "%USERPROFILE%\Pictures\%%~nxd" "%%d" >nul 2>&1
-          if exist "Z:\profile\Videos" for /d %%d in ("Z:\profile\Videos\*") do if not exist "%USERPROFILE%\Videos\%%~nxd" mklink /J "%USERPROFILE%\Videos\%%~nxd" "%%d" >nul 2>&1
+          if exist "Y:\Desktop" for /d %%d in ("Y:\Desktop\*") do if not exist "%USERPROFILE%\Desktop\%%~nxd" mklink /J "%USERPROFILE%\Desktop\%%~nxd" "%%d" >nul 2>&1
+          if exist "Y:\Pictures" for /d %%d in ("Y:\Pictures\*") do if not exist "%USERPROFILE%\Pictures\%%~nxd" mklink /J "%USERPROFILE%\Pictures\%%~nxd" "%%d" >nul 2>&1
+          if exist "Y:\Videos" for /d %%d in ("Y:\Videos\*") do if not exist "%USERPROFILE%\Videos\%%~nxd" mklink /J "%USERPROFILE%\Videos\%%~nxd" "%%d" >nul 2>&1
           "@
           $cmd | Set-Content (Join-Path $startup 'map-e-drive.cmd') -Encoding ascii
 
@@ -260,7 +181,6 @@ jobs:
           Write-Host "  user  : $env:RDP_USER"
           Write-Host '  pass  : your RDP_PASSWORD secret'
           Write-Host '  E: as : Z: after you log in'
-          Write-Host "  saved : S:\profile every $every min"
           Write-Host "  ends  : $($deadline.ToString('HH:mm')) UTC"
           Write-Host '=============================='
           while ((Get-Date) -lt $deadline) {
@@ -268,16 +188,9 @@ jobs:
             Start-Sleep -Seconds 60
           }
 
-      - name: 8. final save + leave tailnet
+      - name: 8. leave tailnet
         if: always()
         shell: pwsh
         run: |
-          if (Test-Path C:\rdp\sync.ps1) {
-            . C:\rdp\sync.ps1
-            Sync-List $env:FOLDERS -Up
-            Write-Host 'light files saved'
-            Sync-List $env:HEAVY -Up
-            Write-Host 'heavy files saved'
-          }
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
           if (Test-Path $ts) { & $ts logout }
