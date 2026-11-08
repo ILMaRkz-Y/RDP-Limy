@@ -1,7 +1,0 @@
-name: ping
-on: workflow_dispatch
-jobs:
-  p:
-    runs-on: windows-2022
-    steps:
-      - run: echo alive

@@ -71,6 +71,17 @@ jobs:
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
+          # windows' local policy rejects short or simple passwords, and a runner is
+          # ephemeral anyway - relax it so whatever is in the secret is accepted.
+          $inf = Join-Path $env:TEMP 'secpol.inf'
+          secedit /export /cfg $inf | Out-Null
+          (Get-Content $inf) -replace '^PasswordComplexity\s*=.*', 'PasswordComplexity = 0' `
+                             -replace '^MinimumPasswordLength\s*=.*', 'MinimumPasswordLength = 0' `
+                             -replace '^MinimumPasswordAge\s*=.*', 'MinimumPasswordAge = 0' |
+            Set-Content $inf -Encoding Unicode
+          secedit /configure /db (Join-Path $env:TEMP 'secpol.sdb') /cfg $inf /areas SECURITYPOLICY | Out-Null
+          Write-Host 'password policy relaxed'
+
           $pw = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
           if (Get-LocalUser -Name $env:RDP_USER -ErrorAction SilentlyContinue) {
             Set-LocalUser -Name $env:RDP_USER -Password $pw
