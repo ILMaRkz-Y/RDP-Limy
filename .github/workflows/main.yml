@@ -1,4 +1,4 @@
-name: "rdp + files on E:"
+﻿name: "rdp + files on E:"
 
 on:
   workflow_dispatch:
@@ -89,7 +89,7 @@ jobs:
       - name: "4. reach E: drive"
         shell: pwsh
         env:
-          SMB_PASSWORD: ${{ secrets:SMB_PASSWORD }}
+          SMB_PASSWORD: ${{ secrets.SMB_PASSWORD }}
         run: |
           $ok = $false
           for ($i = 0; $i -lt 10 -and -not $ok; $i++) {
@@ -146,7 +146,7 @@ jobs:
       - name: 7. session
         shell: pwsh
         env:
-          SMB_PASSWORD: ${{ secrets:SMB_PASSWORD }}
+          SMB_PASSWORD: ${{ secrets.SMB_PASSWORD }}
         run: |
           # Z: = E:\RDP\files, live. The junctions make the big game folders look
           # local, so nothing is copied at boot - the runner is usable in seconds.
