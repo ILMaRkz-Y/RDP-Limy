@@ -1,115 +1,111 @@
 # RDP on a GitHub runner, files on your E: drive
 
-Nothing gets installed on your PC. Four steps, once.
+A Windows Server 2022 runner joins your tailnet for a few hours, you connect with
+RDP, and everything you touch is stored on `E:\RDP` on your own PC. When the run
+ends the VM disappears; your files do not.
+
+Repo: `ILMaRkz-Y/RDP-Limy` · workflow: `.github/workflows/main.yml`
 
 ---
 
-## 1. Share E:\RDP  (as admin, ~5 seconds)
+## Start a session
 
-Right-click `E:\rdp-kit\setup-my-pc.ps1` -> **Run with PowerShell**
+Actions -> **rdp + files on E:** -> *Run workflow*
 
-It prints:
-
-```
-share path   : \\100.120.215.94\RDP
-SMB_USER     : rdpsync
-SMB_PASSWORD : <random, generated for you>
-```
-
-Port 445 is allowed only from `100.64.0.0/10` (the Tailscale range). Your router
-is untouched; nothing is exposed to the internet.
-
-## 2. Move your game folders onto E:  (once)
-
-```
-powershell -File E:\rdp-kit\adopt-local.ps1 -DryRun    # see what it would move
-powershell -File E:\rdp-kit\adopt-local.ps1            # do it
-```
-
-Close Minecraft / Modrinth / Horizon first. It moves each folder to E: and
-leaves a **junction** behind, so the path stays the same and your own PC keeps
-working exactly as before — but now the runner and your PC read the same bytes.
-No copying, no upload, no waiting.
-
-It handles:
-
-| Folder | Size on your pc |
+| Input | Meaning |
 |---|---|
-| `.minecraft` | 3.0 GB |
-| `ModrinthApp\profiles` | 18.5 GB |
-| `ModrinthApp\meta` | 4.2 GB |
-| `ModrinthApp\store` | 3.0 GB |
-| `horizon-launcher` | 1.6 GB |
+| `duration_minutes` | how long the VM stays up, max 300 |
+| `sync_every_minutes` | how often small files are copied back to E: |
 
-## 3. Three secrets
+It takes about 90 seconds to boot, install Tailscale, mount the share and restore
+your files.
 
-Repo -> Settings -> Secrets and variables -> Actions
+## Connect
 
-| Name | Value |
-|---|---|
-| `SMB_PASSWORD` | the password from step 1 |
-| `RDP_PASSWORD` | the password you log into the runner with |
-| `TAILSCALE_AUTHKEY` | a Tailscale key, type **Ephemeral** |
+The node is named `rdp-<run id>`. On any device in your tailnet:
 
-## 4. Drop the workflow in and run it
+```
+tailscale status
+100.107.21.28   rdp-42525833831   windows   active
+```
 
-`E:\rdp-kit\rdp-workflow.yml` -> `.github/workflows/rdp.yml`, commit, run.
+or just read the top of the *7. session* step log, which prints a banner:
+
+```
+========== YOUR RDP ==========
+  host  : 100.107.21.28
+  user  : util
+  pass  : your RDP_PASSWORD secret
+  E: as : Z: after you log in
+```
+
+Open `mstsc`, paste the IP, log in as `util` with `RDP_PASSWORD`.
+
+**One env var, every run.** The address changes with every run because the node
+is ephemeral. Never bookmark it; read it from `tailscale status`.
 
 ---
 
-## The user name is `util` on purpose
+## Where things live
+
+| Folder | Where | How |
+|---|---|---|
+| `.minecraft` | `E:\RDP\files\minecraft` | junction |
+| Modrinth `profiles` | `E:\RDP\files\modrinth\profiles` | junction |
+| Modrinth `meta` | `E:\RDP\files\modrinth\meta` | junction |
+| Modrinth `store` | `E:\RDP\files\modrinth\store` | junction |
+| `horizon-launcher` | `E:\RDP\files\horizon-launcher` | junction |
+| Modrinth `app.db` | `E:\RDP\profile\AppData\Roaming\ModrinthApp` | copied |
+| Firefox profile | `E:\RDP\profile\AppData\Roaming\Mozilla` | copied |
+| Limyrx config | `E:\RDP\profile\AppData\Roaming\Limyrx` | copied |
+| Spotify login | `E:\RDP\profile\AppData\Roaming\Spotify` | copied |
+| VS Code settings | `E:\RDP\profile\AppData\Roaming\Code\User` | copied |
+| `Documents` `Downloads` `Music` | `E:\RDP\profile\...` | copied |
+| `.ssh` `.gitconfig` | `E:\RDP\profile\...` | copied |
+
+**Junction** means the runner does not copy anything: at logon it maps
+`Z:` to `\\100.120.215.94\RDP\files` and points `%APPDATA%\.minecraft` at
+`Z:\minecraft`. The game reads and writes your disk directly, so a 26 GB modpack
+costs nothing at boot.
+
+Your own PC uses the same folders through junctions too (created by
+`adopt-local.ps1`), so there is exactly **one** copy of everything and both
+machines see it.
+
+## Why some things are copied, not junctioned
+
+`app.db` is SQLite in WAL mode, which keeps a shared-memory segment (`-shm`) next
+to the database. That does not work over SMB, so the database stays on the
+runner's local disk and is copied to/from E: at boot and at the end.
+
+`Desktop` (71.8 GB, 1,033,676 files) and `Pictures` (46.2 GB) are **not** in the
+sync list. Copying 122 GB — or even just rescanning a million files — every five
+minutes is slower than the work it saves. If you want them in the session, move
+them to `E:` and junction them the same way as `.minecraft`:
+
+```
+powershell -File E:\rdp-kit\adopt-local.ps1 -IncludeDesktop
+```
+
+## The runner account is called `util` on purpose
 
 Modrinth's `app.db` and most launcher configs store absolute paths like
-`C:\Users\util\AppData\Roaming\...`. If the runner's account is called `RDP`,
-every one of those paths is wrong on the runner and your instances show up
-broken. So the runner creates an account named `util` too, same path, same data.
-
-## What gets copied, and what does not
-
-**Every 5 minutes** (`FOLDERS`)
-
-`Desktop` `Documents` `Downloads` `Pictures` `Videos` `Music`
-`AppData\Roaming\Spotify` · `AppData\Roaming\Code\User` · `.ssh` · `.gitconfig`
-
-**Once at boot, once at the end** (`HEAVY`)
-
-| Path | Why |
-|---|---|
-| `AppData\Roaming\Mozilla` | Firefox profile — logins and cookies survive |
-| `AppData\Roaming\Limyrx` | your launcher's config (103 MB) |
-| `AppData\Roaming\ModrinthApp\app.db` | instance list + accounts (140 MB) |
-| `AppData\Roaming\ModrinthApp\app.db-wal` | SQLite write-ahead log, if present |
-
-`app.db` cannot live on the share: SQLite in WAL mode uses a shared-memory
-segment (`-shm`) that does not work over SMB. It stays local and gets copied
-around the session instead.
-
-**Never copied — junctioned to `Z:` at logon**
-
-| Runner path | Points at |
-|---|---|
-| `%APPDATA%\.minecraft` | `E:\RDP\files\minecraft` |
-| `%APPDATA%\ModrinthApp\profiles` | `E:\RDP\files\modrinth\profiles` |
-| `%APPDATA%\ModrinthApp\meta` | `E:\RDP\files\modrinth\meta` |
-| `%APPDATA%\ModrinthApp\store` | `E:\RDP\files\modrinth\store` |
-| `%APPDATA%\horizon-launcher` | `E:\RDP\files\horizon-launcher` |
-
-`Z:` itself is the live share (`E:\RDP\files`), so anything you drop there is
-on your disk instantly.
+`C:\Users\util\AppData\Roaming\...`. If the runner's account were called `RDP`,
+every stored path would be wrong and your instances would show as missing. Same
+name, same path, same data.
 
 ---
 
 ## Browser logins: Firefox works, Chrome cannot
 
 Chrome and Edge encrypt their cookie database with a key in
-`User Data\Local State`, sealed with **DPAPI**, which is bound to the Windows
-user's SID. The runner builds a new account every run, so the old key cannot be
-unsealed. Copying `User Data` gets you bookmarks, extensions and settings — the
-sites will still log you out.
+`User Data\Local State`, sealed with **DPAPI**, bound to the Windows user's SID.
+The runner builds a new account every run, so the old key cannot be unsealed.
+Copying `User Data` gets you bookmarks, extensions and settings — the sites still
+log you out.
 
 Firefox keeps logins in `logins.json` + `key4.db` inside the profile, with no
-OS-bound key. Copy the profile and the sessions come with it. That is why
-`AppData\Roaming\Mozilla` is in `HEAVY`.
+OS-bound key. Copy the profile and the sessions come with it.
 
 Chrome with Sync signed in: passwords and bookmarks survive, session cookies do not.
 
@@ -117,28 +113,25 @@ Chrome with Sync signed in: passwords and bookmarks survive, session cookies do 
 
 ## Apps
 
-`Modrinth App` installs itself from its GitHub release (`Modrinth.App_x.y.z_x64-setup.exe`,
-run with `/S`). Anything else: drop the installer `.exe` in `E:\RDP\installers`
-and the workflow runs it before the session starts. Inno Setup installers want
-`/VERYSILENT` instead of `/S`.
+`Modrinth App` installs itself from its GitHub release
+(`Modrinth.App_x.y.z_x64-setup.exe`, run with `/S`).
 
-Cracked launchers: put the installer in `E:\RDP\installers` yourself. I am not
-going to wire a download for one. Their data is under `AppData\Roaming\<Name>`
-— add that folder to `HEAVY` and their instances survive.
+Anything else: drop the installer `.exe` in `E:\RDP\installers` and it runs
+before the session starts. NSIS installers take `/S`, Inno Setup takes
+`/VERYSILENT`.
+
+Cracked launchers: put the installer in `E:\RDP\installers` yourself. Their data
+lives in `AppData\Roaming\<Name>` — add that folder to `HEAVY` and the note about
+junctions above, and their instances survive.
 
 ---
 
 ## Things that will bite you
 
-**The PC has to be awake.** Otherwise step 4 retries for 2.5 minutes and fails
-with `cannot reach \\100.120.215.94\RDP`.
+**Your PC has to be awake and on Tailscale.** Otherwise step 4 retries for 2.5
+minutes and fails with `cannot reach \\100.120.215.94\RDP`.
 
-```powershell
-powercfg /change standby-timeout-ac 0
-powercfg /change hibernate-timeout-ac 0
-```
-
-**Close the launcher and browser before you end the session.** `app.db`,
+**Close the launcher and the browser before the session ends.** `app.db`,
 `cookies.sqlite` and `places.sqlite` are locked while their app runs, so the
 final copy skips them.
 
@@ -146,8 +139,20 @@ final copy skips them.
 on E:. Swap `/E` for `/MIR` in `sync.ps1` if you want mirroring — but then a bad
 restore can delete real files.
 
-**Games on `Z:` load slower.** Every asset read is a network round trip instead
-of a disk read. It costs a few extra seconds at start-up; it is the price of not
-copying 30 GB twice per run.
+**Games on `Z:` load slower.** Every asset read is a network round trip. A few
+extra seconds at start-up is the price of not copying 30 GB twice per run.
 
-**If the tailnet IP changes**, edit `PC:` at the top of the workflow.
+**The Tailscale auth key must be created as Ephemeral** in the admin console.
+`tailscale up` has no `--ephemeral` flag; ephemerality is a property of the key.
+
+**Password policy.** The local policy on the runner rejects short or simple
+passwords, so step 2 relaxes `PasswordComplexity` / `MinimumPasswordLength`
+before creating the account. Any `RDP_PASSWORD` works.
+
+**A stuck run can poison the concurrency group.** A run that sits in `queued`
+with `total_count: 0` jobs and refuses to cancel holds the group, and every later
+run queues behind it forever. The fix is to change `concurrency.group` in the
+workflow (it is `rdp-session` now) and push.
+
+**If the tailnet IP of your PC changes**, edit `PC:` in the workflow and in the
+`net use` line of step 7.

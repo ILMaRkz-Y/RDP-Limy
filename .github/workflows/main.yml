@@ -24,7 +24,7 @@ env:
 
   # light tier: small stuff, copied every few minutes
   FOLDERS: >-
-    Desktop,Documents,Downloads,Pictures,Videos,Music,
+    Documents,Downloads,Music,
     AppData\Roaming\Spotify,
     AppData\Roaming\Code\User,
     .ssh,.gitconfig
@@ -35,6 +35,12 @@ env:
     AppData\Roaming\Limyrx,
     AppData\Roaming\ModrinthApp\app.db,
     AppData\Roaming\ModrinthApp\app.db-wal
+  #
+  # LEFT OUT ON PURPOSE - too big to copy, junction them instead (adopt-local.ps1):
+  #   Desktop     71.8 GB   1,033,676 files   (Projects 43, Limyrx 24, Redmi backup 11)
+  #   Pictures    46.2 GB      11,356 files
+  #   Videos       5.8 GB         157 files
+  # Copying 122 GB into the profile every run is slower than just using the share.
   # AppData\Roaming\.tlauncher            (451 MB)
   # AppData\Roaming\PrismLauncher
   # AppData\Roaming\ATLauncher
@@ -238,6 +244,11 @@ jobs:
           if exist "Z:\modrinth\store" if not exist "%APPDATA%\ModrinthApp\store" mklink /J "%APPDATA%\ModrinthApp\store" "Z:\modrinth\store" >nul 2>&1
 
           if exist "Z:\horizon-launcher" if not exist "%APPDATA%\horizon-launcher" mklink /J "%APPDATA%\horizon-launcher" "Z:\horizon-launcher" >nul 2>&1
+
+          rem only if adopt-local.ps1 was run with -IncludeDesktop / -IncludePictures / -IncludeVideos
+          if exist "Z:\profile\Desktop" for /d %%d in ("Z:\profile\Desktop\*") do if not exist "%USERPROFILE%\Desktop\%%~nxd" mklink /J "%USERPROFILE%\Desktop\%%~nxd" "%%d" >nul 2>&1
+          if exist "Z:\profile\Pictures" for /d %%d in ("Z:\profile\Pictures\*") do if not exist "%USERPROFILE%\Pictures\%%~nxd" mklink /J "%USERPROFILE%\Pictures\%%~nxd" "%%d" >nul 2>&1
+          if exist "Z:\profile\Videos" for /d %%d in ("Z:\profile\Videos\*") do if not exist "%USERPROFILE%\Videos\%%~nxd" mklink /J "%USERPROFILE%\Videos\%%~nxd" "%%d" >nul 2>&1
           "@
           $cmd | Set-Content (Join-Path $startup 'map-e-drive.cmd') -Encoding ascii
 
