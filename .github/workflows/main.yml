@@ -143,6 +143,46 @@ jobs:
             }
           }
 
+      - name: "6b. Mesa software OpenGL"
+        shell: pwsh
+        run: |
+          # the runner is a cloud VM with no GPU: without this, OpenGL is 1.1 and
+          # minecraft dies at start-up. Mesa's llvmpipe renders on the CPU instead.
+          # the mingw build is the one that ships opengl32.dll (msvc does not).
+          $rel   = Invoke-RestMethod 'https://api.github.com/repos/pal1000/mesa-dist-win/releases/latest' `
+                     -Headers @{ 'User-Agent' = 'rdp' }
+          $asset = $rel.assets | Where-Object { $_.name -like '*release-mingw.7z' } | Select-Object -First 1
+          if (-not $asset) { throw 'no mesa mingw build in the latest release' }
+          $pkg = "$env:TEMP\mesa.7z"
+          Invoke-WebRequest $asset.browser_download_url -OutFile $pkg
+          Write-Host "mesa $($rel.tag_name)"
+
+          $sevenZip = @('C:\Program Files\7-Zip\7z.exe','C:\Program Files (x86)\7-Zip\7z.exe') |
+                        Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $sevenZip) { throw 'no 7-Zip on this runner' }
+          & $sevenZip x $pkg "-o$env:TEMP\mesa" -y | Out-Null
+
+          $x64 = Join-Path $env:TEMP 'mesa\x64'
+          $sys = Join-Path $env:SystemRoot 'System32'
+          foreach ($dll in 'opengl32.dll','libgallium_wgl.dll','libEGL.dll','libGLESv2.dll','libGLESv1_CM.dll') {
+            $src = Join-Path $x64 $dll
+            if (-not (Test-Path $src)) { Write-Warning "$dll missing from the package"; continue }
+            $dst = Join-Path $sys $dll
+            if (Test-Path $dst) {
+              # system32 belongs to trustedinstaller; take it before overwriting
+              takeown /f $dst /a | Out-Null
+              icacls $dst /grant '*S-1-5-32-544:(F)' | Out-Null
+            }
+            Copy-Item $src $dst -Force
+            $v = (Get-Item $dst).VersionInfo
+            Write-Host ("  {0,-22} {1}" -f $dll, $(if ($v.FileDescription) { $v.FileDescription } else { 'installed' }))
+          }
+
+          [Environment]::SetEnvironmentVariable('GALLIUM_DRIVER', 'llvmpipe', 'Machine')
+          [Environment]::SetEnvironmentVariable('LIBGL_ALWAYS_SOFTWARE', '1', 'Machine')
+          [Environment]::SetEnvironmentVariable('MESA_GL_VERSION_OVERRIDE', '4.5', 'Machine')
+          Write-Host 'mesa installed system-wide, llvmpipe forced'
+
       - name: 7. session
         shell: pwsh
         env:
