@@ -1,0 +1,254 @@
+name: "rdp plain (no concurrency)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: How long to keep the session up (max 300)
+        default: "180"
+      sync_every_minutes:
+        description: "How often to copy back to E:"
+        default: "5"
+
+env:
+  # same name as your windows account on purpose: configs and databases store
+  # absolute paths like C:\Users\util\..., and they have to match on both machines.
+  RDP_USER: util
+  PROFILE: C:\Users\util
+  PC: \\100.120.215.94\RDP          # <- your pc on the tailnet (see setup-my-pc.ps1 output)
+  SMB_USER: rdpsync
+
+  # light tier: small stuff, copied every few minutes
+  FOLDERS: >-
+    Desktop,Documents,Downloads,Pictures,Videos,Music,
+    AppData\Roaming\Spotify,
+    AppData\Roaming\Code\User,
+    .ssh,.gitconfig
+
+  # heavy tier: hundreds of MB, copied once at boot and once at the end.
+  HEAVY: >-
+    AppData\Roaming\Mozilla,
+    AppData\Roaming\Limyrx,
+    AppData\Roaming\ModrinthApp\app.db,
+    AppData\Roaming\ModrinthApp\app.db-wal
+  # AppData\Roaming\.tlauncher            (451 MB)
+  # AppData\Roaming\PrismLauncher
+  # AppData\Roaming\ATLauncher
+  # AppData\Roaming\Telegram Desktop\tdata
+  #
+  # NOT copied, junctioned to Z: at logon instead (step 7):
+  #   %APPDATA%\.minecraft                 3 GB
+  #   %APPDATA%\ModrinthApp\profiles      18 GB  instances
+  #   %APPDATA%\ModrinthApp\meta           4 GB  metadata cache
+  #   %APPDATA%\ModrinthApp\store          3 GB  downloaded jars
+  #   %APPDATA%\horizon-launcher         1.6 GB
+
+jobs:
+  rdp:
+    runs-on: windows-2022
+    timeout-minutes: 350            # hard ceiling; the job stops itself earlier
+
+    steps:
+      - name: 1. turn RDP on
+        shell: pwsh
+        run: |
+          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0 -Type DWord
+          $tcp = 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
+          Set-ItemProperty $tcp -Name UserAuthentication -Value 0 -Type DWord
+          Set-ItemProperty $tcp -Name SecurityLayer      -Value 0 -Type DWord
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 profile=any remoteip=100.64.0.0/10 | Out-Null
+          powercfg /change standby-timeout-ac 0
+          powercfg /change monitor-timeout-ac 0
+          Restart-Service TermService -Force
+
+      - name: 2. RDP user
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $pw = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          if (Get-LocalUser -Name $env:RDP_USER -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name $env:RDP_USER -Password $pw
+          } else {
+            New-LocalUser -Name $env:RDP_USER -Password $pw -AccountNeverExpires -PasswordNeverExpires | Out-Null
+          }
+          foreach ($g in 'Administrators','Remote Desktop Users') {
+            if (-not (Get-LocalGroupMember -Group $g -Member $env:RDP_USER -ErrorAction SilentlyContinue)) {
+              Add-LocalGroupMember -Group $g -Member $env:RDP_USER
+            }
+          }
+
+      - name: 3. tailscale
+        shell: pwsh
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          Invoke-WebRequest 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' -OutFile "$env:TEMP\ts.msi"
+          Start-Process msiexec.exe -ArgumentList "/i `"$env:TEMP\ts.msi`" /quiet /norestart" -Wait
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          & $ts up --authkey=$env:TS_AUTHKEY --hostname="rdp-$env:GITHUB_RUN_ID" --ephemeral
+          $ip = $null
+          for ($i = 0; $i -lt 24 -and -not $ip; $i++) {
+            Start-Sleep 5
+            $ip = (& $ts ip -4 2>$null | Select-Object -First 1)
+          }
+          if (-not $ip) { throw 'tailscale got no ip' }
+          "TAILSCALE_IP=$ip" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: "4. reach E: drive + helpers"
+        shell: pwsh
+        env:
+          SMB_PASSWORD: ${{ secrets.SMB_PASSWORD }}
+        run: |
+          $ok = $false
+          for ($i = 0; $i -lt 10 -and -not $ok; $i++) {
+            try {
+              New-SmbMapping -LocalPath 'S:' -RemotePath $env:PC -UserName $env:SMB_USER `
+                -Password $env:SMB_PASSWORD -Persistent $false -ErrorAction Stop
+              $ok = $true
+            } catch {
+              Write-Host "not reachable yet, retry $i : $($_.Exception.Message)"
+              Start-Sleep 15
+            }
+          }
+          if (-not $ok) { throw "cannot reach $env:PC - is the pc on, awake, and connected to tailscale?" }
+          Get-ChildItem S:\ | Format-Table Name
+
+          New-Item -ItemType Directory C:\rdp -Force | Out-Null
+          @'
+          $global:RdpHome  = $env:PROFILE
+          $global:RdpShelf = 'S:\profile'
+
+          function Sync-Path([string]$rel, [switch]$Up) {
+            $rel = $rel.Trim().Trim('\')
+            if (-not $rel) { return }
+            $src = if ($Up) { Join-Path $global:RdpHome  $rel } else { Join-Path $global:RdpShelf $rel }
+            $dst = if ($Up) { Join-Path $global:RdpShelf $rel } else { Join-Path $global:RdpHome  $rel }
+            if (-not (Test-Path -LiteralPath $src)) { return }
+
+            if (Test-Path -LiteralPath $src -PathType Container) {
+              New-Item -ItemType Directory $dst -Force | Out-Null
+              robocopy $src $dst /E /R:1 /W:1 /NFL /NDL /NJH /NJS /NP /XF *.tmp *.crdownload | Out-Null
+              if ($LASTEXITCODE -ge 8) { Write-Warning "sync $rel -> $($LASTEXITCODE)" }
+            } else {
+              New-Item -ItemType Directory (Split-Path $dst -Parent) -Force | Out-Null
+              Copy-Item -LiteralPath $src -Destination $dst -Force -ErrorAction SilentlyContinue
+            }
+            $global:LASTEXITCODE = 0
+          }
+
+          function Sync-List([string]$list, [switch]$Up) {
+            foreach ($rel in $list.Split(',')) { Sync-Path $rel -Up:$Up }
+          }
+          '@ | Set-Content C:\rdp\sync.ps1 -Encoding utf8
+
+      - name: 5. pull my files back
+        shell: pwsh
+        run: |
+          . C:\rdp\sync.ps1
+          New-Item -ItemType Directory $env:PROFILE -Force | Out-Null
+          # hand the profile folder to RDP before windows builds the profile, or first logon can fail
+          $acl = Get-Acl $env:PROFILE
+          $acl.SetOwner([System.Security.Principal.NTAccount]$env:RDP_USER)
+          $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+            $env:RDP_USER,'FullControl','ContainerInherit,ObjectInherit','None','Allow'))
+          Set-Acl $env:PROFILE $acl
+
+          Sync-List $env:FOLDERS -Down
+          Write-Host 'light files restored'
+          Sync-List $env:HEAVY -Down
+          Write-Host 'heavy files restored'
+
+      - name: 6. apps
+        shell: pwsh
+        run: |
+          # Modrinth App, straight from its releases
+          try {
+            $rel   = Invoke-RestMethod 'https://api.github.com/repos/modrinth/code/releases/latest' `
+                       -Headers @{ 'User-Agent' = 'rdp' }
+            $asset = $rel.assets | Where-Object { $_.name -like '*x64-setup.exe' } | Select-Object -First 1
+            if (-not $asset) { throw 'no setup.exe in the latest release' }
+            $exe = "$env:TEMP\$($asset.name)"
+            Invoke-WebRequest $asset.browser_download_url -OutFile $exe
+            Start-Process $exe -ArgumentList '/S' -Wait
+            Write-Host "Modrinth App $($rel.tag_name) installed"
+          } catch {
+            Write-Warning "Modrinth install failed: $($_.Exception.Message)"
+          }
+
+          # anything you drop in E:\RDP\installers runs silently here.
+          # NSIS uses /S, Inno Setup uses /VERYSILENT - rename or edit if one needs it.
+          if (Test-Path 'S:\installers') {
+            Get-ChildItem 'S:\installers' -Filter *.exe | ForEach-Object {
+              Write-Host "installing $($_.Name)"
+              Start-Process $_.FullName -ArgumentList '/S' -Wait
+            }
+          }
+
+      - name: 7. session
+        shell: pwsh
+        env:
+          SMB_PASSWORD: ${{ secrets.SMB_PASSWORD }}
+        run: |
+          $loop = 'C:\rdp\loop.ps1'
+          @'
+          param($Every)
+          . C:\rdp\sync.ps1
+          while ($true) {
+            Sync-List $env:FOLDERS -Up
+            Start-Sleep -Seconds (60 * [int]$Every)
+          }
+          '@ | Set-Content $loop -Encoding utf8
+
+          $every = '${{ inputs.sync_every_minutes }}'
+          Start-Process pwsh -WindowStyle Hidden -ArgumentList @('-NoProfile','-File',$loop,'-Every',$every)
+
+          # Z: = the whole E:\RDP\files, live, inside your session (220 GB, nothing copied).
+          # the junctions make big game folders appear as normal local folders.
+          $startup = Join-Path $env:PROFILE 'AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup'
+          New-Item -ItemType Directory $startup -Force | Out-Null
+          $cmd = @"
+          @echo off
+          net use Z: $env:PC\files /user:$env:SMB_USER $env:SMB_PASSWORD /persistent:no >nul 2>&1
+
+          if exist "Z:\minecraft" if not exist "%APPDATA%\.minecraft" mklink /J "%APPDATA%\.minecraft" "Z:\minecraft" >nul 2>&1
+
+          if not exist "%APPDATA%\ModrinthApp" mkdir "%APPDATA%\ModrinthApp" >nul 2>&1
+          if exist "Z:\modrinth\profiles" if not exist "%APPDATA%\ModrinthApp\profiles" mklink /J "%APPDATA%\ModrinthApp\profiles" "Z:\modrinth\profiles" >nul 2>&1
+          if exist "Z:\modrinth\meta" if not exist "%APPDATA%\ModrinthApp\meta" mklink /J "%APPDATA%\ModrinthApp\meta" "Z:\modrinth\meta" >nul 2>&1
+          if exist "Z:\modrinth\store" if not exist "%APPDATA%\ModrinthApp\store" mklink /J "%APPDATA%\ModrinthApp\store" "Z:\modrinth\store" >nul 2>&1
+
+          if exist "Z:\horizon-launcher" if not exist "%APPDATA%\horizon-launcher" mklink /J "%APPDATA%\horizon-launcher" "Z:\horizon-launcher" >nul 2>&1
+          "@
+          $cmd | Set-Content (Join-Path $startup 'map-e-drive.cmd') -Encoding ascii
+
+          $minutes  = [Math]::Min([int]'${{ inputs.duration_minutes }}', 300)
+          $deadline = (Get-Date).AddMinutes($minutes)
+          Write-Host ''
+          Write-Host '========== YOUR RDP =========='
+          Write-Host "  host  : $env:TAILSCALE_IP"
+          Write-Host "  user  : $env:RDP_USER"
+          Write-Host '  pass  : your RDP_PASSWORD secret'
+          Write-Host '  E: as : Z: after you log in'
+          Write-Host "  saved : S:\profile every $every min"
+          Write-Host "  ends  : $($deadline.ToString('HH:mm')) UTC"
+          Write-Host '=============================='
+          while ((Get-Date) -lt $deadline) {
+            Write-Host ("[{0:HH:mm}] up, {1} min left" -f (Get-Date), [math]::Round(($deadline - (Get-Date)).TotalMinutes))
+            Start-Sleep -Seconds 60
+          }
+
+      - name: 8. final save + leave tailnet
+        if: always()
+        shell: pwsh
+        run: |
+          if (Test-Path C:\rdp\sync.ps1) {
+            . C:\rdp\sync.ps1
+            Sync-List $env:FOLDERS -Up
+            Write-Host 'light files saved'
+            Sync-List $env:HEAVY -Up
+            Write-Host 'heavy files saved'
+          }
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (Test-Path $ts) { & $ts logout }

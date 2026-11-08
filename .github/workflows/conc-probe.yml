@@ -1,0 +1,11 @@
+name: concurrency probe
+on: workflow_dispatch
+concurrency:
+  group: rdp
+  cancel-in-progress: true
+jobs:
+  p:
+    runs-on: windows-2022
+    steps:
+      - name: alive
+        run: echo alive
