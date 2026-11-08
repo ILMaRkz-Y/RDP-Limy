@@ -102,13 +102,16 @@ jobs:
           Invoke-WebRequest 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' -OutFile "$env:TEMP\ts.msi"
           Start-Process msiexec.exe -ArgumentList "/i `"$env:TEMP\ts.msi`" /quiet /norestart" -Wait
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          & $ts up --authkey=$env:TS_AUTHKEY --hostname="rdp-$env:GITHUB_RUN_ID" --ephemeral
+          # --ephemeral is not a flag of "up" - a node is ephemeral because the auth
+          # key itself is ephemeral. Create the key as Ephemeral in the admin console.
+          & $ts up --auth-key="$env:TS_AUTHKEY" --hostname="rdp-$env:GITHUB_RUN_ID" --unattended --timeout=120s
+          if ($LASTEXITCODE -ne 0) { throw "tailscale up failed (exit $LASTEXITCODE)" }
           $ip = $null
           for ($i = 0; $i -lt 24 -and -not $ip; $i++) {
             Start-Sleep 5
             $ip = (& $ts ip -4 2>$null | Select-Object -First 1)
           }
-          if (-not $ip) { throw 'tailscale got no ip' }
+          if (-not $ip) { & $ts status; throw 'tailscale got no ip' }
           "TAILSCALE_IP=$ip" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: "4. reach E: drive + helpers"
